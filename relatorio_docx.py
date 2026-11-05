@@ -147,18 +147,18 @@ def _tabela(doc, cabecalho: list[str], linhas: list[list], larguras: list[int],
     _margens_celula(tab)
     borda = (4, CINZA_CLARO)
 
-    def preencher(cell, valor, i, negrito=False, cor=ESCURO, fundo=None):
+    def preencher(cell, valor, i, negrito=False, cor=ESCURO, fundo=None, tam=9, bordas=None):
         _largura(cell, larguras[i])
         cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
         if fundo:
             _sombrear(cell, fundo)
-        _bordas(cell, bottom=borda)
+        _bordas(cell, **(bordas or {"bottom": borda}))
         texto, nivel = (valor if isinstance(valor, tuple) else (valor, None))
         par = cell.paragraphs[0]
         par.paragraph_format.space_before = par.paragraph_format.space_after = Pt(0)
         if i in direita:
             par.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        _texto(par, str(texto), 9, NIVEL[nivel] if nivel else cor, negrito or bool(nivel))
+        _texto(par, str(texto), tam, NIVEL[nivel] if nivel else cor, negrito or bool(nivel))
 
     cab = tab.rows[0]
     _repetir_cabecalho(cab)
@@ -173,7 +173,9 @@ def _tabela(doc, cabecalho: list[str], linhas: list[list], larguras: list[int],
         row = tab.add_row()
         _nao_quebrar(row)
         for i, valor in enumerate(total):
-            preencher(row.cells[i], valor, i, negrito=True, fundo="E6F4FF")
+            preencher(row.cells[i], valor, i, negrito=True, cor="FFFFFF", fundo=ESCURO, tam=10.5,
+                      bordas={"top": (18, AZUL)})
+            row.height = Pt(22)
 
 
 def _painel(doc, cartoes: list[tuple[str, str, str, list[str]]]) -> None:
@@ -232,18 +234,39 @@ def gerar(dados: dict, caminho: Path, pdf: bool = False) -> list[Path]:
                 [[c["item"], c["contratado"], c["real"], (c["pct"], c["nivel"])] for c in r["consumo"]],
                 [3370, 1900, 1900, 1900], {1, 2, 3})
 
+    if r["erros"]:
+        _titulo_secao(doc, "Erros encontrados",
+                      "Problemas identificados nos backups do período e o motivo de cada um.")
+        _tabela(doc, ["Servidor / Rotina", "O que deu errado", "Por quê", "Quando"],
+                [[e["onde"], (e["problema"], e["nivel"]), e["motivo"], e["data"]] for e in r["erros"]],
+                [2000, 1950, 3420, 1700], {3})
+
     if r["armazenamento"]:
         _titulo_secao(doc, "Armazenamento")
-        _tabela(doc, ["Armazenamento", "Used Space", "Free Space"],
+        _tabela(doc, ["Armazenamento", "Espaço usado", "Espaço livre"],
                 [[a["nome"], analise.fmt_bytes(a["usado"]),
                   analise.fmt_bytes(a["livre"]) if a["livre"] is not None else "—"] for a in r["armazenamento"]],
                 [4870, 2100, 2100], {1, 2})
 
     if r["servidores"]:
-        _titulo_secao(doc, "Servidores")
-        _tabela(doc, ["Servidor", "Job", "Último backup"],
-                [[x["nome"], x["job"], (x["ultimo"], x["nivel"])] for x in r["servidores"]],
-                [3570, 3500, 2000], {2})
+        total = sum(x["espaco"] or 0 for x in r["servidores"])
+
+        def pct(n) -> str:
+            return f"{100 * n / total:.1f}%".replace(".", ",") if total and n else "—"
+
+        _titulo_secao(doc, "Servidores",
+                      "Status: verde = em dia; amarelo = atrasado; vermelho = desatualizado ou sem backup. "
+                      "Retenção = por quanto tempo as cópias são guardadas (nuvem) ou quantas cópias estão "
+                      "guardadas hoje (Veeam). Consumo = espaço ocupado pelas cópias de cada servidor; "
+                      "% = participação no total de backups.")
+        _tabela(doc, ["Servidor", "Rotina de backup", "Último backup", "Status", "Retenção", "Consumo", "%"],
+                [[x["nome"], "—" if x["status"] == "Sem backup" and not x["copias"] else x["job"],
+                  x["ultimo"] if x["ultimo"] != "Sem backup" else "—",
+                  (x["status"], x["nivel"]), x["retencao"],
+                  analise.fmt_bytes(x["espaco"]) if x["espaco"] else "—", pct(x["espaco"])]
+                 for x in r["servidores"]],
+                [1600, 1450, 1650, 1400, 1100, 1150, 720], {2, 4, 5, 6},
+                total=["Total", "", "", "", "", analise.fmt_bytes(total), "100%" if total else "—"])
 
     doc.core_properties.title = f"Relatório de Backup - {r['razao_social']}"
     doc.core_properties.author = "IDX Data Centers"

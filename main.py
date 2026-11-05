@@ -4,6 +4,7 @@
     python main.py crp uniggel     # só os informados
     python main.py crp --json      # também grava os dados coletados em JSON
     python main.py --listar        # lista os clientes cadastrados
+    python main.py crp --simular-erros   # exemplo com erros fictícios (arquivo "-SIMULACAO")
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import logging
 import re
 import sys
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import analise
 import config
@@ -45,12 +46,44 @@ def coletar(chave: str) -> dict:
     return {"chave": chave, "cliente": cli, "coletado_em": agora, "veeam": v, "scp": s}
 
 
+def simular_erros(dados: dict) -> None:
+    """Injeta erros fictícios nos dados coletados, só para ver como a tabela de erros fica."""
+    v, agora = dados["veeam"], dados["coletado_em"]
+    ativos = [j for j in v["jobs"] if j["ativo"]]
+    if ativos:  # rotina que falhou, com o motivo vindo de um alarme
+        j = ativos[0]
+        j["status"] = "Failed"
+        v["alarmes"].append({"nome": "Backup job state", "status": "Error", "data": j["ultima_execucao"],
+                             "origem": j["servidor"], "tipo_origem": "VbrBackupServer", "repeticoes": 1,
+                             "descricao": f'Job "{j["nome"]}" finished with Failed. Error: Unable to connect '
+                                          "to the backup repository. Not enough free space."})
+    if len(ativos) > 1:  # rotina concluída com aviso
+        ativos[1]["status"] = "Warning"
+    maquinas = [m for m in v["maquinas"] if m["job"] in {j["nome"] for j in ativos}]
+    if maquinas:  # servidor sem cópia há 12 dias
+        maquinas[-1]["ultimo_backup"] = agora - timedelta(days=12)
+    if len(maquinas) > 1:  # servidor que ficou de fora da última execução
+        job = next(j for j in ativos if j["nome"] == maquinas[len(maquinas) // 2]["job"])
+        maquinas[len(maquinas) // 2]["ultimo_backup"] = job["ultima_execucao"] - timedelta(days=1)
+    v["alarmes"].append({"nome": "Backup repository free space", "status": "Warning",
+                         "data": agora - timedelta(hours=5), "origem": "repositorio", "repeticoes": 1,
+                         "tipo_origem": "VbrRepository",
+                         "descricao": "Repository free space is below 15%."})
+    for t in dados["scp"]["tenants"]:  # servidor na nuvem com backup atrasado
+        vm = next((x for x in t["vms"] if x["politicas"]), None)
+        if vm:
+            vm["ultimo_backup"] = agora - timedelta(days=3)
+            break
+
+
 def principal(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Relatório de backup por cliente (Veeam ONE + SCP).")
     ap.add_argument("clientes", nargs="*", help=f"chaves de clientes.py (padrão: todos: {', '.join(CLIENTES)})")
     ap.add_argument("--saida", default=str(config.PASTA_SAIDA), help="pasta dos relatórios")
     ap.add_argument("--json", action="store_true", help="grava também os dados coletados (.json)")
     ap.add_argument("--pdf", action="store_true", help="gera também o PDF (exige Microsoft Word)")
+    ap.add_argument("--simular-erros", action="store_true",
+                    help="gera um exemplo com erros fictícios (arquivo com sufixo -SIMULACAO)")
     ap.add_argument("--listar", action="store_true", help="lista os clientes cadastrados e sai")
     args = ap.parse_args(argv)
 
@@ -73,6 +106,9 @@ def principal(argv: list[str] | None = None) -> int:
             falhas += 1
             continue
         base = f"relatorio-backup-{_slug(dados['cliente']['nome'])}-{dados['coletado_em'].astimezone(analise.BRT):%Y-%m-%d}"
+        if args.simular_erros:
+            simular_erros(dados)
+            base += "-SIMULACAO"
         if args.json:
             caminho = config.Path(args.saida) / f"{base}.json"
             caminho.parent.mkdir(parents=True, exist_ok=True)

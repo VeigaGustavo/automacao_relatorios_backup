@@ -22,7 +22,8 @@ CLIENTES = {
         "nome": "CRP",
         "razao_social": "CRP",
         "scp_tenants": ["TN - CRP"],
-        # CRP não está no cadastro de contratos do automacao_veeam: preencher
+        # CRP não é cliente (faz parte do grupo IDX): sem contrato, o relatório sai sem
+        # a tabela Contratado x Consumo
         "contrato": {"servidores": None, "volume_gb": None},
         "veeam": {
             "servidores": [],
