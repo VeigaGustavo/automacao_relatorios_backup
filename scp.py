@@ -197,6 +197,8 @@ def _politicas(projeto_id: str, ids_vms: set[str]) -> list[dict]:
 
 
 def coletar(cliente_cfg: dict) -> dict:
+    if not cliente_cfg.get("scp_tenants"):
+        return {"tenants": [], "avisos": []}  # cliente sem nuvem Sangfor
     projetos = _lista(_get("/janus/20180725/projects"))
     avisos: list[str] = []
     tenants = []

@@ -270,23 +270,28 @@ def montar(dados: dict) -> dict:
     vol_veeam = sum(m["backup_bytes"] for m in maquinas)
     vol_scp = sum(vm["backup_bytes"] for vm in vms)
     quota = sum(t["quota_bytes"] for t in s["tenants"])
+    # Cloud Connect: o cliente roda o próprio VBR; só a contagem de máquinas da cota é visível
+    qtd_cc = sum(c["servidores"] + c["vms"] + c["estacoes"] for c in v["cloud_connect"])
+    qtd_veeam = len(nomes_veeam) + qtd_cc
     # Cartões: (rótulo, valor, cor, linhas de detalhe)
     painel = [
         ("Repositório (em uso)", fmt_bytes(quota + usado_veeam), "azul",
          [f"Nuvem {fmt_bytes(quota)}", f"Veeam {fmt_bytes(usado_veeam)}"] if usado_veeam and quota else []),
-        ("VMs", str(len(vms) + len(nomes_veeam)), "escuro",
-         [f"Nuvem {len(vms)}", f"Veeam {len(nomes_veeam)}"] if vms and nomes_veeam else []),
-        ("Disco alocado", fmt_bytes(sum(vm["disco_bytes"] for vm in vms)), "escuro", ["servidores na nuvem"]),
-        ("Total de backups", fmt_bytes(vol_scp + vol_veeam), "azul",
-         [f"Nuvem {fmt_bytes(vol_scp)}", f"Veeam {fmt_bytes(vol_veeam)}"] if vol_scp and vol_veeam else []),
+        ("VMs", str(len(vms) + qtd_veeam), "escuro",
+         [f"Nuvem {len(vms)}", f"Veeam {qtd_veeam}"] if vms and qtd_veeam else []),
     ]
+    if vms:  # disco alocado só existe para as VMs da nuvem Sangfor
+        painel.append(("Disco alocado", fmt_bytes(sum(vm["disco_bytes"] for vm in vms)), "escuro",
+                       ["servidores na nuvem"]))
+    painel.append(("Total de backups", fmt_bytes(vol_scp + vol_veeam), "azul",
+                   [f"Nuvem {fmt_bytes(vol_scp)}", f"Veeam {fmt_bytes(vol_veeam)}"] if vol_scp and vol_veeam else []))
 
     # Contratado x consumo real: só Veeam (mesma medição do automacao_veeam). A nuvem Sangfor (SCP)
     # só é usada pela Uniggel e pela CRP (grupo IDX) e não entra no contrato de backup
     contrato = cli.get("contrato") or {}
     consumo = []
     for item, contratado, real, fmt in [
-        ("Servidores em backup", contrato.get("servidores"), len(nomes_veeam), lambda n: f"{n:.0f}"),
+        ("Servidores em backup", contrato.get("servidores"), qtd_veeam, lambda n: f"{n:.0f}"),
         ("Volume de backup", (contrato.get("volume_gb") or 0) * 1024**3 or None, usado_veeam, fmt_bytes),
     ]:
         if not contratado:
