@@ -139,7 +139,7 @@ def _titulo_secao(doc, titulo: str, explicacao: str = "") -> None:
 # ------------------------------------------------------------------ tabelas
 
 def _tabela(doc, cabecalho: list[str], linhas: list[list], larguras: list[int],
-            direita: set[int] = frozenset(), total: list | None = None) -> None:
+            direita: set[int] = frozenset(), total: list | None = None, tam: float = 9) -> None:
     """linhas: valores str ou (texto, nivel) para colorir a célula."""
     tab = doc.add_table(rows=1, cols=len(cabecalho))
     tab.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -147,7 +147,7 @@ def _tabela(doc, cabecalho: list[str], linhas: list[list], larguras: list[int],
     _margens_celula(tab)
     borda = (4, CINZA_CLARO)
 
-    def preencher(cell, valor, i, negrito=False, cor=ESCURO, fundo=None, tam=9, bordas=None):
+    def preencher(cell, valor, i, negrito=False, cor=ESCURO, fundo=None, tam=tam, bordas=None):
         _largura(cell, larguras[i])
         cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
         if fundo:
@@ -228,45 +228,57 @@ def gerar(dados: dict, caminho: Path, pdf: bool = False) -> list[Path]:
 
     _painel(doc, r["painel"])
 
-    if r["consumo"]:
-        _titulo_secao(doc, "Contratado x Consumo")
-        _tabela(doc, ["Item", "Contratado", "Consumo", "Uso"],
-                [[c["item"], c["contratado"], c["real"], (c["pct"], c["nivel"])] for c in r["consumo"]],
-                [3370, 1900, 1900, 1900], {1, 2, 3})
+    fb = analise.fmt_bytes
+    rotulo, explica = analise.MEDICAO[r["medicao"]]
+    grupos = r["grupos"]
 
-    if r["erros"]:
-        _titulo_secao(doc, "Erros encontrados",
-                      "Problemas identificados nos backups do período e o motivo de cada um.")
-        _tabela(doc, ["Servidor / Rotina", "O que deu errado", "Por quê", "Quando"],
-                [[e["onde"], (e["problema"], e["nivel"]), e["motivo"], e["data"]] for e in r["erros"]],
-                [2000, 1950, 3420, 1700], {3})
+    # Resumo por origem (topo)
+    if grupos:
+        _titulo_secao(doc, "Resumo", f"{rotulo} = {explica}.")
+        n = sum(len(g["servidores"]) for g in grupos)
+        em_dia = sum(g["em_dia"] for g in grupos)
+        vol = sum(g["volume"] for g in grupos)
+        _tabela(doc, ["Origem", "Servidores", "Em dia", "Sem backup", rotulo],
+                [[g["origem"], str(len(g["servidores"])), (str(g["em_dia"]), "ok"),
+                  (str(g["sem_backup"]), "critico" if g["sem_backup"] else None),
+                  fb(g["volume"]) if g["volume"] else "—"] for g in grupos],
+                [2470, 1650, 1650, 1650, 1650], {1, 2, 3, 4},
+                total=["Total", str(n), str(em_dia), str(n - em_dia), fb(vol) if vol else "—"])
+
+    if r["consumo"]:
+        _titulo_secao(doc, "Contratado x Consumo", "Livre = contratado − utilizado.")
+        _tabela(doc, ["Item", "Medição", "Contratado", "Utilizado", "Livre", "Uso"],
+                [[c["item"], analise.MEDICAO[c["medicao"]][0] if c["medicao"] else "—",
+                  c["contratado"], c["real"], c["livre"], (c["pct"], c["nivel"])] for c in r["consumo"]],
+                [2170, 1300, 1400, 1400, 1800, 1000], {2, 3, 4, 5})
 
     if r["armazenamento"]:
         _titulo_secao(doc, "Armazenamento")
-        _tabela(doc, ["Armazenamento", "Espaço usado", "Espaço livre"],
-                [[a["nome"], analise.fmt_bytes(a["usado"]),
-                  analise.fmt_bytes(a["livre"]) if a["livre"] is not None else "—"] for a in r["armazenamento"]],
-                [4870, 2100, 2100], {1, 2})
+        usado = sum(a["usado"] for a in r["armazenamento"])
+        _tabela(doc, ["Armazenamento", "Espaço utilizado"],
+                [[a["nome"], fb(a["usado"])] for a in r["armazenamento"]],
+                [6470, 2600], {1},
+                total=["Total utilizado", fb(usado)] if len(r["armazenamento"]) > 1 else None)
 
-    if r["servidores"]:
-        total = sum(x["espaco"] or 0 for x in r["servidores"])
-
-        def pct(n) -> str:
-            return f"{100 * n / total:.1f}%".replace(".", ",") if total and n else "—"
-
+    if grupos:
         _titulo_secao(doc, "Servidores",
-                      "Status: verde = em dia; amarelo = atrasado; vermelho = desatualizado ou sem backup. "
+                      "Status: Em dia = último backup concluído dentro do agendamento; Sem backup = backup "
+                      "com falha, atrasado ou inexistente. "
                       "Retenção = por quanto tempo as cópias são guardadas (nuvem) ou quantas cópias estão "
-                      "guardadas hoje (Veeam). Consumo = espaço ocupado pelas cópias de cada servidor; "
-                      "% = participação no total de backups.")
-        _tabela(doc, ["Servidor", "Rotina de backup", "Último backup", "Status", "Retenção", "Consumo", "%"],
-                [[x["nome"], "—" if x["status"] == "Sem backup" and not x["copias"] else x["job"],
-                  x["ultimo"] if x["ultimo"] != "Sem backup" else "—",
-                  (x["status"], x["nivel"]), x["retencao"],
-                  analise.fmt_bytes(x["espaco"]) if x["espaco"] else "—", pct(x["espaco"])]
-                 for x in r["servidores"]],
-                [1600, 1450, 1650, 1400, 1100, 1150, 720], {2, 4, 5, 6},
-                total=["Total", "", "", "", "", analise.fmt_bytes(total), "100%" if total else "—"])
+                      f"guardadas hoje (Veeam). {rotulo} = {explica}"
+                      + (f"; o total conta cada servidor uma vez e só os com backup nos últimos "
+                         f"{config.DIAS_PERIODO} dias." if r["medicao"] == "frontend" else "."))
+        for g in grupos:
+            if len(grupos) > 1:
+                sub = _paragrafo(doc, g["origem"], 11, AZUL, True, antes=8, depois=4)
+                sub.paragraph_format.keep_with_next = True
+            _tabela(doc, ["Servidor", "Agendamento", "Último backup", "Status", "Retenção", rotulo],
+                    [[x["nome"], x["agendamento"],
+                      x["ultimo"] if x["ultimo"] != "Sem backup" else "—",
+                      (x["status"], x["nivel"]), x["retencao"], fb(x["volume"]) if x["volume"] else "—"]
+                     for x in g["servidores"]],
+                    [1900, 1500, 1350, 1250, 1350, 1720], {2, 4, 5},
+                    total=["Total", "", "", "", "", fb(g["volume"]) if g["volume"] else "—"])
 
     doc.core_properties.title = f"Relatório de Backup - {r['razao_social']}"
     doc.core_properties.author = "IDX Data Centers"

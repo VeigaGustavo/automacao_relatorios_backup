@@ -6,7 +6,6 @@ Independente do formato de saída. Cada valor com cor vem com um nível:
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timedelta, timezone
 
 import config
@@ -61,154 +60,54 @@ def _nivel_scp(d: datetime | None, agora: datetime) -> str:
     return "alerta" if horas <= config.DIAS_CRITICO_BACKUP * 24 else "critico"
 
 
-# ------------------------------------------------------------------ erros
+# ------------------------------------------------------------------ volumetria contratada
 
-# Alarmes do Veeam ONE em linguagem do cliente: nome -> o que aconteceu
-_ALARMES = {
-    "backup job state": "Falha na execução do backup",
-    "vm with no backup": "Servidor sem backup recente",
-    "computer with no backup": "Servidor sem backup recente",
-    "suspicious incremental backup size": "Tamanho do backup fora do padrão",
-    "unusual job duration": "Duração do backup fora do padrão",
-    "backup repository free space": "Pouco espaço no armazenamento de backup",
-    "backup repository connection failure": "Armazenamento de backup inacessível",
-    "job disabled": "Backup desativado",
-    "cloud tenant quota usage": "Cota de cópia externa quase cheia",
+# Onde o volume do contrato é medido: (rótulo no relatório, explicação para o cliente)
+#   frontend = On-premise: dados nos servidores do cliente (origem)
+#   backend  = Cloud: cópias de backup no armazenamento de destino
+MEDICAO = {
+    "frontend": ("On-premise", "espaço usado nos discos dos servidores protegidos (origem)"),
+    "backend": ("Cloud", "espaço ocupado pelas cópias de backup no armazenamento de destino, "
+                         "com todas as cópias da retenção"),
 }
-_NORMALIZADO = re.compile(r"back to normal|resolved", re.I)
 
 
-def _dias(d: datetime, agora: datetime) -> str:
-    n = (agora - d).days
-    return "hoje" if n <= 0 else "há 1 dia" if n == 1 else f"há {n} dias"
+def medir_volume(vol: dict, maquinas: list[dict], usado_backend: float, agora: datetime) -> dict:
+    """Mede um volume do contrato conforme vol["medicao"]:
+
+    backend   espaço usado no destino: cota em uso da nuvem Sangfor (SCP) + repositórios Veeam do
+              cliente (compartilhado = só os backups dele) + cota usada do Cloud Connect.
+              Mesmo valor do cartão "Repositório (em uso)".
+    frontend  dados na origem: usedSourceSizeBytes de cada máquina protegida (ver
+              frontend_por_servidor). vol["maquinas"] restringe às
+              máquinas cobertas pelo contrato. Cloud Connect não entra: a origem fica no VBR do cliente.
+    """
+    medicao = (vol.get("medicao") or "").strip().lower()
+    if medicao not in MEDICAO:
+        raise ValueError(f"contrato: medicao deve ser 'frontend' ou 'backend' (veio {vol.get('medicao')!r})")
+    if medicao == "backend":
+        return {"medicao": medicao, "bytes": usado_backend, "maquinas": {}}
+    filtro = {m.upper() for m in vol.get("maquinas") or []}
+    origem = frontend_por_servidor([(m["nome"], m["origem_bytes"], m["ultimo_backup"]) for m in maquinas
+                                    if not filtro or m["nome"].upper() in filtro], agora)
+    return {"medicao": medicao, "bytes": sum(origem.values()), "maquinas": origem,
+            "faltando": sorted(filtro - set(origem))}
 
 
-def _agenda(texto: str | None) -> str:
-    """'Diário 22:00' -> ' para todos os dias às 22:00' (para encaixar na frase)."""
-    if not texto or texto == "-":
-        return ""
-    m = re.fullmatch(r"(.*?)\s*(\d{2}:\d{2})", texto.strip())
-    if not m:
-        return f" ({texto})"
-    dias, hora = m.groups()
-    if dias.lower().startswith("di") and "rio" in dias.lower():
-        return f" para todos os dias às {hora}"
-    if dias.startswith("Dia "):
-        return f" para todo dia {dias[4:]} do mês às {hora}"
-    return f" para {dias} às {hora}"
-
-
-# Mensagens frequentes do Veeam (inglês) -> português; o que não estiver aqui vai como veio
-_FRASES = [
-    (r"(?:Repository )?free space is below (\d+)\s*%", r"o espaço livre do armazenamento está abaixo de \1%"),
-    (r"Not enough free space(?: on (?:the )?(?:backup )?repository)?", "não há espaço livre suficiente"),
-    (r"Unable to connect to (?:the )?(?:backup )?repository", "não foi possível conectar ao armazenamento de backup"),
-    (r"Failed to create (?:VM )?snapshot", "não foi possível criar o snapshot do servidor"),
-    (r"Failed to connect to (?:the )?host", "não foi possível conectar ao servidor"),
-    (r"(?:Operation )?timed out|timeout", "tempo limite excedido"),
-    (r"Access is denied", "acesso negado"),
-    (r"The network path was not found", "caminho de rede não encontrado"),
-    (r"Error:\s*", ""),
-]
-
-
-def _traduzir(t: str) -> str:
-    for de, para in _FRASES:
-        t = re.sub(de, para, t, flags=re.I)
-    frases = [f.strip(" .:-") for f in re.split(r"(?<=\.)\s+", t)]
-    return " ".join(f[:1].upper() + f[1:] + "." for f in frases if f)
-
-
-def _motivo_alarme(descricao: str) -> str:
-    """Traduz os textos mais comuns do Veeam ONE; o restante vai como veio."""
-    t = re.sub(r"\s+", " ", descricao or "").strip()
-    m = re.search(r'Job "([^"]+)" finished with (\w+)', t, re.I)
-    if m:
-        estado = {"failed": "falha", "warning": "aviso"}.get(m.group(2).lower(), m.group(2))
-        resto = _traduzir(t[m.end():])
-        return f'A rotina de backup "{m.group(1)}" terminou com {estado}' + (f". {resto}" if resto else ".")
-    return _traduzir(t) or "—"
-
-
-def _erros(jobs: dict, maquinas: list, vms: list, politicas: dict, alarmes: list, agora: datetime) -> list[dict]:
-    """Um item por problema: o que deu errado, onde e por quê. Lista vazia = nada a reportar."""
-    erros = []
-    alarmes_ativos = [a for a in alarmes
-                      if (a["status"] or "").lower() != "resolved" and not _NORMALIZADO.search(a["descricao"])]
-
-    def alarme_do_job(nome: str) -> dict | None:
-        return next((a for a in alarmes_ativos if f'"{nome.upper()}"' in a["descricao"].upper()), None)
-
-    # 1. Jobs cuja última execução falhou ou terminou com aviso
-    jobs_com_erro = set()
-    for j in jobs.values():
-        st = (j["status"] or "").lower()
-        if st not in ("failed", "warning"):
+def frontend_por_servidor(linhas: list[tuple], agora: datetime) -> dict[str, float]:
+    """(nome, bytes na origem, último backup) -> {NOME: bytes}, para somar o Front-End:
+    - só servidores com backup nos últimos DIAS_PERIODO dias (os parados não estão sendo protegidos);
+    - servidor em mais de uma linha (dois jobs, ou VM recriada com o mesmo nome) conta uma vez,
+      com o valor da linha de backup mais recente."""
+    limite = agora - timedelta(days=config.DIAS_PERIODO)
+    escolhido: dict[str, tuple] = {}
+    for nome, n, ultimo in linhas:
+        if not n or not ultimo or ultimo < limite:
             continue
-        jobs_com_erro.add(j["nome"])
-        alm = alarme_do_job(j["nome"])
-        erros.append({
-            "onde": j["nome"], "data": j["ultima_execucao"],
-            "problema": "Backup falhou" if st == "failed" else "Backup concluído com aviso",
-            "motivo": _motivo_alarme(alm["descricao"]) if alm else
-                      ("A última execução da rotina terminou com erro; parte ou todos os servidores não foram copiados."
-                       if st == "failed" else "A última execução terminou, mas com avisos em algum servidor."),
-            "nivel": "critico" if st == "failed" else "alerta",
-        })
-
-    # 2. Servidores do Veeam sem cópia recente
-    for m in maquinas:
-        nivel = _nivel_veeam(m, jobs.get(m["job"]), agora)
-        if nivel == "ok":
-            continue
-        d, job = m["ultimo_backup"], jobs.get(m["job"])
-        if not d:
-            problema, motivo = "Nenhum backup concluído", f'O servidor está na rotina "{m["job"]}", mas não há cópia registrada.'
-        elif nivel == "critico":
-            problema = "Backup desatualizado"
-            motivo = f'A última cópia concluída pela rotina "{m["job"]}" foi {_dias(d, agora)}.'
-        else:
-            problema = "Ficou de fora da última execução"
-            motivo = (f'A rotina "{m["job"]}" rodou em {fmt_data(job["ultima_execucao"])}, '
-                      "mas este servidor não foi copiado.")
-        erros.append({"onde": m["nome"], "data": d, "problema": problema, "motivo": motivo, "nivel": nivel})
-
-    # 3. Servidores na nuvem (SCP) com política, mas sem backup recente
-    for vm in vms:
-        if not vm["politicas"]:
-            continue  # sem backup contratado: aparece só na tabela de servidores
-        d = vm["ultimo_backup"]
-        nivel = _nivel_scp(d, agora)
-        if nivel == "ok":
-            continue
-        pol = vm["politicas"][0]
-        quando = _agenda((politicas.get(pol) or {}).get("agendamento"))
-        if not d:
-            problema, motivo = "Nenhum backup concluído", f"O backup está programado{quando}, mas nenhuma cópia foi registrada."
-        else:
-            problema = "Backup desatualizado"
-            motivo = (f"O backup está programado{quando}, mas a última cópia concluída foi "
-                      f"{_dias(d, agora)}.")
-        erros.append({"onde": vm["nome"], "data": d, "problema": problema, "motivo": motivo, "nivel": nivel})
-
-    # 4. Alarmes ainda ativos que não se referem a um job já listado
-    for a in alarmes_ativos:
-        if any(f'"{n.upper()}"' in a["descricao"].upper() for n in jobs_com_erro):
-            continue
-        cita = re.search(r'(?:Job|VM|Computer) "([^"]+)"', a["descricao"])
-        erros.append({
-            "onde": cita.group(1) if cita else "Infraestrutura de backup", "data": a["data"],
-            "problema": _ALARMES.get(a["nome"].lower(), a["nome"]),
-            "motivo": _motivo_alarme(a["descricao"]),
-            "nivel": "critico" if (a["status"] or "").lower() == "error" else "alerta",
-        })
-
-    antigo = datetime.min.replace(tzinfo=timezone.utc)
-    erros.sort(key=lambda e: e["data"] or antigo, reverse=True)
-    erros.sort(key=lambda e: e["nivel"] != "critico")
-    for e in erros:
-        e["data"] = fmt_data(e["data"]) if e["data"] else "—"
-    return erros
+        atual = escolhido.get(nome.upper())
+        if atual is None or ultimo > atual[1]:
+            escolhido[nome.upper()] = (n, ultimo)
+    return {nome: n for nome, (n, _) in escolhido.items()}
 
 
 # ------------------------------------------------------------------ montagem
@@ -223,30 +122,57 @@ def montar(dados: dict) -> dict:
 
     politicas = {p["nome"]: p for t in s["tenants"] for p in t["politicas"]}
 
-    # Servidores: Veeam e nuvem (SCP) numa tabela só; o job é uma coluna
+    # Servidores: Veeam e nuvem Sangfor (SCP); "origem" separa as tabelas no relatório
     # Retenção: SCP = configuração da política; Veeam = cópias guardadas (a API não expõe a configuração)
     servidores = []
     for m in maquinas:
         servidores.append({
-            "nome": m["nome"], "job": m["job"], "ultimo": fmt_data(m["ultimo_backup"]),
+            "origem": "Veeam", "nome": m["nome"], "job": m["job"], "ultimo": fmt_data(m["ultimo_backup"]),
+            "agendamento": jobs[m["job"]].get("agendamento") or "—",
             "nivel": _nivel_veeam(m, jobs.get(m["job"]), agora),
-            "copias": m["restore_points"], "espaco": m["backup_bytes"],
+            "copias": m["restore_points"], "espaco": m["backup_bytes"], "frontend": m["origem_bytes"] or None,
             "retencao": (f"{m['restore_points']} cópia" + ("s" if m["restore_points"] != 1 else ""))
                         if m["restore_points"] else "—",
+            "bruto": m,
         })
     for vm in vms:
         sem = not vm["politicas"] and not vm["pontos"]
         servidores.append({
-            "nome": vm["nome"], "job": ", ".join(vm["politicas"]) or "Sem backup configurado",
+            "origem": "Sangfor", "nome": vm["nome"], "job": ", ".join(vm["politicas"]) or "Sem backup configurado",
             "ultimo": "Sem backup" if sem else fmt_data(vm["ultimo_backup"]),
+            "agendamento": ", ".join(dict.fromkeys(politicas[p]["agendamento"] for p in vm["politicas"]
+                                                   if p in politicas)) or "—",
             "nivel": "critico" if sem else _nivel_scp(vm["ultimo_backup"], agora),
-            "copias": vm["pontos"], "espaco": vm["backup_bytes"],
+            "copias": vm["pontos"], "espaco": vm["backup_bytes"], "frontend": vm.get("usado_bytes"),
             "retencao": next((politicas[p]["retencao"] for p in vm["politicas"] if p in politicas), "—"),
+            "bruto": vm,
         })
+    # Coluna de volume única, na medição do contrato (1º volume; sem volume contratado = Cloud)
+    contrato = cli.get("contrato") or {}
+    med_volume = next((str(vol.get("medicao") or "").strip().lower() for vol in contrato.get("volumes") or []),
+                   "backend")
     for x in servidores:
-        x["status"] = {"ok": "Em dia", "alerta": "Atrasado"}.get(
-            x["nivel"], "Sem backup" if x["ultimo"] in ("—", "Sem backup") else "Desatualizado")
+        # Status binário: em dia (verde) ou sem backup (vermelho)
+        x["sem_backup"] = x["ultimo"] in ("—", "Sem backup")
+        x["status"] = "Em dia" if x["nivel"] == "ok" else "Sem backup"
+        x["nivel"] = "ok" if x["nivel"] == "ok" else "critico"
+        x["volume"] = x["frontend"] if med_volume == "frontend" else x["espaco"]
     servidores.sort(key=lambda x: (x["nome"].lower(), x["job"].lower()))
+
+    # Uma tabela por origem (Veeam / Sangfor) + resumo no topo
+    grupos = []
+    for origem in ("Veeam", "Sangfor"):
+        lista = [x for x in servidores if x["origem"] == origem]
+        if not lista:
+            continue
+        if med_volume == "frontend":  # cada servidor uma vez, só os com backup no período
+            volume = sum(frontend_por_servidor([(x["nome"], x["frontend"], x["bruto"]["ultimo_backup"])
+                                                for x in lista], agora).values())
+        else:
+            volume = sum(x["espaco"] or 0 for x in lista)
+        em_dia = sum(1 for x in lista if x["nivel"] == "ok")
+        grupos.append({"origem": origem, "servidores": lista, "em_dia": em_dia,
+                       "sem_backup": len(lista) - em_dia, "volume": volume})
 
     # Armazenamento Veeam: em repositório compartilhado, Used Space = só os backups do cliente
     uso_cliente: dict[str, float] = {}
@@ -286,29 +212,45 @@ def montar(dados: dict) -> dict:
     painel.append(("Total de backups", fmt_bytes(vol_scp + vol_veeam), "azul",
                    [f"Nuvem {fmt_bytes(vol_scp)}", f"Veeam {fmt_bytes(vol_veeam)}"] if vol_scp and vol_veeam else []))
 
-    # Contratado x consumo real: só Veeam (mesma medição do automacao_veeam). A nuvem Sangfor (SCP)
-    # só é usada pela Uniggel e pela CRP (grupo IDX) e não entra no contrato de backup
-    contrato = cli.get("contrato") or {}
+    # Contratado x consumo real. Livre = contratado − backup utilizado; no Back-End o utilizado é o
+    # mesmo total do cartão "Repositório (em uso)": cota em uso da nuvem Sangfor (SCP) + Veeam
+    # Servidores: máquinas Veeam + VMs da nuvem com backup (política ou pontos; a sem backup não está protegida)
+    qtd_scp_protegidas = sum(1 for vm in vms if vm["politicas"] or vm["pontos"])
+    linhas_contrato = [("Servidores em backup", contrato.get("servidores"), qtd_veeam + qtd_scp_protegidas,
+                        lambda n: f"{n:.0f}", None)]
+    medicoes = []
+    for vol in contrato.get("volumes") or []:
+        med = medir_volume(vol, maquinas, quota + usado_veeam, agora)
+        medicoes.append(med)
+        linhas_contrato.append(("Volume de backup", (vol.get("gb") or 0) * 1024**3,
+                                med["bytes"], fmt_bytes, med["medicao"]))
     consumo = []
-    for item, contratado, real, fmt in [
-        ("Servidores em backup", contrato.get("servidores"), qtd_veeam, lambda n: f"{n:.0f}"),
-        ("Volume de backup", (contrato.get("volume_gb") or 0) * 1024**3 or None, usado_veeam, fmt_bytes),
-    ]:
+    for item, contratado, real, fmt, medicao in linhas_contrato:
         if not contratado:
             continue
         pct = 100 * real / contratado
-        consumo.append({"item": item, "contratado": fmt(contratado), "real": fmt(real), "pct": fmt_pct(pct),
-                        "nivel": "critico" if pct > 100 else "alerta" if pct >= 85 else "ok"})
-
-    erros = _erros(jobs, maquinas, vms, politicas, v["alarmes"], agora)
+        nivel = "critico" if pct > 100 else "alerta" if pct >= 85 else "ok"
+        # Livre = contratado − utilizado; acima do contratado mostra o excedente
+        livre = (fmt(contratado - real), None) if real <= contratado else (f"Excedido {fmt(real - contratado)}",
+                                                                            "critico")
+        consumo.append({"item": item, "contratado": fmt(contratado), "real": fmt(real), "livre": livre,
+                        "pct": fmt_pct(pct), "medicao": medicao, "nivel": nivel})
 
     return {
         "cliente": cli["nome"],
         "razao_social": cli.get("razao_social") or cli["nome"],
+        "coletado_em": agora,
         "periodo": f"{fmt_data(inicio, False)} a {fmt_data(agora, False)}",
         "painel": painel,
         "consumo": consumo,
-        "erros": erros,
         "servidores": servidores,
+        "medicao": med_volume,
+        "grupos": grupos,
         "armazenamento": armazenamento,
+        # valores intermediários, para o arquivo de evidências
+        "calculo": {"quota": quota, "usado_veeam": usado_veeam, "vol_veeam": vol_veeam, "vol_scp": vol_scp,
+                    "qtd_scp": len(vms), "qtd_veeam": qtd_veeam, "qtd_cc": qtd_cc,
+                    "qtd_scp_protegidas": qtd_scp_protegidas,
+                    "disco": sum(vm["disco_bytes"] for vm in vms), "armazenamento": armazenamento,
+                    "medicoes": medicoes},
     }

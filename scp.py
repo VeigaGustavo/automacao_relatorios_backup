@@ -15,6 +15,7 @@ import hmac
 import json
 import logging
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import config
+import evidencias
 
 log = logging.getLogger(__name__)
 
@@ -71,10 +73,14 @@ def _get(caminho: str, **params: Any) -> Any:
     params = {k: v for k, v in params.items() if v is not None and v != ""}
     url = config.SCP_BASE_URL + caminho + ("?" + urllib.parse.urlencode(params) if params else "")
     req = urllib.request.Request(url, headers={"Accept": "application/json", **_cabecalhos_ec2("GET", url)})
+    inicio = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=config.SCP_TIMEOUT_SEGUNDOS, context=_SSL) as r:
-            return json.loads(r.read() or b"null")
+            resposta = json.loads(r.read() or b"null")
+        evidencias.registrar("Sangfor SCP", "GET", caminho, inicio, resposta)
+        return resposta
     except urllib.error.HTTPError as exc:
+        evidencias.registrar("Sangfor SCP", "GET", caminho, inicio, None, exc.code)
         raise ErroSCP(f"GET {caminho} -> HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:200]}") from exc
     except urllib.error.URLError as exc:
         raise ErroSCP(f"GET {url} -> {exc.reason}") from exc
@@ -155,7 +161,7 @@ _DIAS_SEMANA = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"]
 
 
 def formatar_cron(cron: str | None) -> str:
-    """Quartz (seg min hora dia mês dia-semana): '0 0 20 * * ?' -> 'Diário 20:00'."""
+    """Quartz (seg min hora dia mês dia-semana): '0 0 20 * * ?' -> 'Diário às 20:00'."""
     f = str(cron or "").split()
     if len(f) < 6 or not f[1].isdigit() or not f[2].isdigit():
         return cron or "-"
@@ -163,10 +169,10 @@ def formatar_cron(cron: str | None) -> str:
     dom, dow = f[3], f[5]
     if dow not in ("?", "*"):
         dias = [(_DIAS_SEMANA[int(x) - 1] if x.isdigit() and 1 <= int(x) <= 7 else x) for x in dow.split(",")]
-        return f"{', '.join(dias)} {hora}"
+        return f"{', '.join(dias)} às {hora}"
     if dom not in ("?", "*"):
-        return f"Dia {dom} {hora}"
-    return f"Diário {hora}"
+        return f"Dia {dom} de cada mês às {hora}"
+    return f"Diário às {hora}"
 
 
 # ------------------------------------------------------------- coleta
@@ -267,6 +273,8 @@ def _coletar_tenant(proj: dict, avisos: list[str]) -> dict:
             "status": vm.get("status") or "-",
             "so": vm.get("os_name") or vm.get("os_type") or "-",
             "disco_bytes": disco_mb * 1024**2,
+            # espaço usado nos discos da VM (storage_status.used_mb): o dado de origem (Front-End)
+            "usado_bytes": float((vm.get("storage_status") or {}).get("used_mb") or 0) * 1024**2 or None,
             "politicas": nomes_pol,
             "pontos": len(pts),
             "primeiro_backup": min(datas) if datas else None,
@@ -284,6 +292,7 @@ def _coletar_tenant(proj: dict, avisos: list[str]) -> dict:
             "tipo": p.get("type") or "-",
             "ativa": str(p.get("enable")) == "1",
             "agendamento": formatar_cron(p.get("trigger_cron")),
+            "cron": p.get("trigger_cron"),
             "retencao": formatar_retencao(sched.get("retention")),
             "janela_h": sched.get("duration_hours"),
             "vms": sum(1 for r in p.get("resources") or [] if str(r.get("id")) in ids),

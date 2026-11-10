@@ -50,7 +50,7 @@ SCP_SERVICE = os.environ.get("SCP_SERVICE") or "open-api"
 SCP_TIMEOUT_SEGUNDOS = int(os.environ.get("SCP_TIMEOUT_SEGUNDOS") or 90)
 
 # --- Relatório ---
-# Janela usada para "backup recente", alarmes e job ativo/inativo
+# Janela usada para "backup recente" e job ativo/inativo
 DIAS_PERIODO = int(os.environ.get("RELATORIO_DIAS_PERIODO") or 30)
 # Último backup com mais de N horas fica em alerta (amarelo); mais de N dias, vermelho
 HORAS_ALERTA_BACKUP = int(os.environ.get("RELATORIO_HORAS_ALERTA") or 36)

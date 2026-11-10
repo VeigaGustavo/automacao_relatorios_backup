@@ -5,7 +5,7 @@ Gera um relatório Word (.docx, e opcionalmente PDF) por cliente, sobre o papel 
 
 | Fonte | O que entra no relatório |
 |---|---|
-| **Veeam ONE** (REST, somente leitura) | Jobs (status, última execução, duração, dados transferidos), máquinas protegidas (restore points, último backup, tamanho), repositórios (capacidade/uso/imutabilidade), cota do Cloud Connect e alarmes de backup |
+| **Veeam ONE** (REST, somente leitura) | Jobs (status, última execução, duração, dados transferidos), máquinas protegidas (restore points, último backup, tamanho), repositórios (capacidade/uso/imutabilidade) e cota do Cloud Connect |
 | **SCP** (Open-API, assinatura EC2) | Políticas de backup e retenção, VMs do tenant com pontos de backup, último backup e volume |
 
 Clientes cadastrados no protótipo: **CRP** e **Uniggel Sementes** (`clientes.py`).
@@ -49,9 +49,20 @@ Linguagem simples, voltada ao cliente. Cabeçalho, rodapé e margens vêm do `te
 - **Volume Veeam**: soma lógica dos restore points das máquinas (com fast clone em ReFS/XFS pode
   passar do espaço físico). Repositórios compartilhados (CRP) mostram o uso total do disco.
 - **Volume SCP**: soma do `size` dos pontos de backup (em KB), mesma regra do scp-console.
-- **Alarmes**: só origens da infraestrutura de backup (`Vbr*`) que citam um job/máquina do cliente
-  ou vêm do VBR/repositório dedicado; avisos de versão, CVE e licença são descartados.
+- **Volumetria contratada**: cada item de `contrato.volumes` em `clientes.py` diz onde é medido
+  (`medicao`, obrigatório), conforme o contrato:
+  - `"backend"` (destino): cota em uso da nuvem Sangfor (SCP) + espaço usado pelas cópias no
+    repositório Veeam do cliente (compartilhado = só os backups dele) + cota usada do Cloud Connect.
+    É o mesmo valor do cartão "Repositório (em uso)". Livre = contratado − esse total.
+  - `"frontend"` (origem): `usedSourceSizeBytes` das máquinas protegidas, uma vez por máquina (a mesma
+    máquina em dois jobs não soma duas vezes). `maquinas` restringe às máquinas cobertas pelo item
+    (ex.: AKC ID 215, só FISIOLOGIA-01/02). Cloud Connect não tem Front-End visível.
+  O relatório mostra a medição no nome da linha ("Volume de backup (Front-End)") e explica o termo.
 - Sessões de job (`/sessions`) não estão disponíveis para o papel Read-Only do Veeam ONE.
+- **Agendamento**: a API pública não expõe o agendamento dos jobs, então ele vem do Report Catalog
+  (mesma API da prévia do Web Client, `webview/...`): "Protected VMs Job Schedule" (colunas
+  Schedule / Time / Runs On) e, para o que ele não cobre (agentes), "Job Configuration Dump".
+  Jobs de Proxmox não aparecem em nenhum dos dois e ficam com "—". Na nuvem (SCP), vem da política.
 
 ## Cadastro de clientes (`clientes.py`)
 
@@ -60,6 +71,8 @@ Linguagem simples, voltada ao cliente. Cabeçalho, rodapé e margens vêm do `te
     "nome": "Uniggel Sementes",
     "razao_social": "UNIGGEL SEMENTES, INDÚSTRIA E COMÉRCIO LTDA",
     "scp_tenants": ["TN - UNIGGEL SEMENTES"],      # nome exato do tenant no SCP
+    "contrato": {"servidores": 30,                 # None = não contratado
+                 "volumes": [{"gb": 5120, "medicao": "backend"}]},  # "frontend" = origem, "backend" = destino
     "veeam": {
         "servidores": ["10.10.100.15"],              # VBR dedicado: todos os jobs entram
         "jobs_regex": None,                          # para VBR compartilhado (CRP: r"\bCRP\b")
